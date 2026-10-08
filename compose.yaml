@@ -1,0 +1,43 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "50051:50051"
+    environment:
+      - WORKER_ADDR=scheduler-worker:50051
+    depends_on:
+      scheduler-worker:
+        condition: service_healthy
+
+  scheduler-worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      - GRPC_PORT=50051
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; socket.create_connection(('127.0.0.1', 50051), 2).close()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 300s # need to wait for qwen to download
+
+volumes:
+  huggingface-cache:
