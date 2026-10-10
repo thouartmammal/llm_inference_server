@@ -1,0 +1,57 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "gpu": "Google Colab T4",
+  "gateway_url": "http://127.0.0.1:8080/generate",
+  "arrival_rate_rps": 0.05,
+  "measurement_seconds": 300,
+  "elapsed_seconds": 298.6360927,
+  "warmup_requests": 1,
+  "seed": 1,
+  "prompt_profiles": [
+    {
+      "name": "short",
+      "text": "Explain KV cache in one sentence."
+    },
+    {
+      "name": "medium",
+      "text": "Explain how prefill and decode work in an LLM inference server, and why the KV cache makes decoding more efficient."
+    },
+    {
+      "name": "long",
+      "text": "Describe the request lifecycle in a GPU LLM inference server. Cover prompt tokenization, prefill, autoregressive decoding, the KV cache, streaming generated tokens to a client, end-of-sequence handling, and why scheduling multiple requests can improve GPU utilization. Give a concise but technically accurate explanation."
+    }
+  ],
+  "output_token_mix": [
+    32,
+    64,
+    128
+  ],
+  "requests_offered": 24,
+  "requests_started": 24,
+  "requests_dropped_at_inflight_limit": 0,
+  "requests_completed": 24,
+  "requests_failed": 0,
+  "generated_tokens": 1464,
+  "successful_requests_per_second": 0.0803653697147371,
+  "generated_tokens_per_second": 4.902287552598962,
+  "ttft_ms": {
+    "p50": 12330.163,
+    "p95": 38883.44,
+    "mean": 14079.262791666666
+  },
+  "inter_token_latency_ms": {
+    "p50": 163.097,
+    "p95": 177.956,
+    "mean": 165.43667013888881
+  },
+  "end_to_end_latency_ms": {
+    "p50": 21343.801,
+    "p95": 49784.094,
+    "mean": 24100.69208333333
+  },
+  "prompt_token_counts": {
+    "p50": 54,
+    "p95": 89,
+    "mean": 67.25
+  }
+}

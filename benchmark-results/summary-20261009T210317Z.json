@@ -1,0 +1,258 @@
+{
+  "mode": "idle",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "gpu": "Google Colab T4",
+  "gateway_url": "http://127.0.0.1:8080/generate",
+  "arrival_rate_rps": 0,
+  "measurement_seconds": 254.6129141,
+  "elapsed_seconds": 254.6129141,
+  "warmup_requests": 3,
+  "seed": 1,
+  "prompt_profiles": [
+    {
+      "name": "short",
+      "text": "Explain KV cache in one sentence."
+    },
+    {
+      "name": "medium",
+      "text": "Explain how prefill and decode work in an LLM inference server, and why the KV cache makes decoding more efficient."
+    },
+    {
+      "name": "long",
+      "text": "Describe the request lifecycle in a GPU LLM inference server. Cover prompt tokenization, prefill, autoregressive decoding, the KV cache, streaming generated tokens to a client, end-of-sequence handling, and why scheduling multiple requests can improve GPU utilization. Give a concise but technically accurate explanation."
+    }
+  ],
+  "output_token_mix": [
+    32,
+    64,
+    128
+  ],
+  "requests_offered": 27,
+  "requests_started": 27,
+  "requests_dropped_at_inflight_limit": 0,
+  "requests_completed": 27,
+  "requests_failed": 0,
+  "generated_tokens": 1524,
+  "successful_requests_per_second": 0.10604332500352148,
+  "generated_tokens_per_second": 5.985556566865435,
+  "ttft_ms": {
+    "p50": 170.779,
+    "p95": 190.713,
+    "mean": 173.14725925925927
+  },
+  "inter_token_latency_ms": {
+    "p50": 163.175,
+    "p95": 178.84,
+    "mean": 165.41046760187044
+  },
+  "end_to_end_latency_ms": {
+    "p50": 5513.251,
+    "p95": 21298.92,
+    "mean": 9429.54588888889
+  },
+  "prompt_token_counts": {
+    "p50": 54,
+    "p95": 89,
+    "mean": 60
+  },
+  "idle_cases": [
+    {
+      "prompt_name": "short",
+      "requested_output_tokens": 32,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 171.971,
+        "p95": 185.772,
+        "mean": 175.29133333333334
+      },
+      "inter_token_latency_ms": {
+        "p50": 163.216,
+        "p95": 185.017,
+        "mean": 166.17592982456145
+      },
+      "end_to_end_latency_ms": {
+        "p50": 3358.803,
+        "p95": 3358.931,
+        "mean": 3332.851
+      }
+    },
+    {
+      "prompt_name": "short",
+      "requested_output_tokens": 64,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 169.366,
+        "p95": 170.779,
+        "mean": 169.65933333333334
+      },
+      "inter_token_latency_ms": {
+        "p50": 164.121,
+        "p95": 181.445,
+        "mean": 166.92317543859647
+      },
+      "end_to_end_latency_ms": {
+        "p50": 3320.541,
+        "p95": 3440.901,
+        "mean": 3341.423666666667
+      }
+    },
+    {
+      "prompt_name": "short",
+      "requested_output_tokens": 128,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 169.015,
+        "p95": 175.015,
+        "mean": 170.93166666666664
+      },
+      "inter_token_latency_ms": {
+        "p50": 162.771,
+        "p95": 178.99,
+        "mean": 165.02852631578952
+      },
+      "end_to_end_latency_ms": {
+        "p50": 3300.043,
+        "p95": 3340.783,
+        "mean": 3306.6949999999997
+      }
+    },
+    {
+      "prompt_name": "medium",
+      "requested_output_tokens": 32,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 173.036,
+        "p95": 190.713,
+        "mean": 178.30866666666665
+      },
+      "inter_token_latency_ms": {
+        "p50": 163.782,
+        "p95": 179.389,
+        "mean": 166.4588387096774
+      },
+      "end_to_end_latency_ms": {
+        "p50": 5499.393,
+        "p95": 5513.251,
+        "mean": 5467.379333333333
+      }
+    },
+    {
+      "prompt_name": "medium",
+      "requested_output_tokens": 64,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 172.53,
+        "p95": 172.547,
+        "mean": 171.2976666666667
+      },
+      "inter_token_latency_ms": {
+        "p50": 163.579,
+        "p95": 177.107,
+        "mean": 165.65884126984128
+      },
+      "end_to_end_latency_ms": {
+        "p50": 10733.826,
+        "p95": 10783.486,
+        "mean": 10734.661666666667
+      }
+    },
+    {
+      "prompt_name": "medium",
+      "requested_output_tokens": 128,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 167.84,
+        "p95": 193.453,
+        "mean": 176.16166666666666
+      },
+      "inter_token_latency_ms": {
+        "p50": 162.851,
+        "p95": 178.891,
+        "mean": 165.09857480314957
+      },
+      "end_to_end_latency_ms": {
+        "p50": 21266.358,
+        "p95": 21303.808,
+        "mean": 21272.334000000003
+      }
+    },
+    {
+      "prompt_name": "long",
+      "requested_output_tokens": 32,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 168.126,
+        "p95": 173.074,
+        "mean": 169.65833333333333
+      },
+      "inter_token_latency_ms": {
+        "p50": 162.99,
+        "p95": 174.986,
+        "mean": 164.82189247311837
+      },
+      "end_to_end_latency_ms": {
+        "p50": 5353.754,
+        "p95": 5521.291,
+        "mean": 5406.409333333333
+      }
+    },
+    {
+      "prompt_name": "long",
+      "requested_output_tokens": 64,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 171.67,
+        "p95": 182.117,
+        "mean": 174.70399999999998
+      },
+      "inter_token_latency_ms": {
+        "p50": 162.767,
+        "p95": 178.802,
+        "mean": 165.27510582010586
+      },
+      "end_to_end_latency_ms": {
+        "p50": 10723.124,
+        "p95": 10736.649,
+        "mean": 10715.021999999999
+      }
+    },
+    {
+      "prompt_name": "long",
+      "requested_output_tokens": 128,
+      "repetitions": 3,
+      "completed": 3,
+      "failed": 0,
+      "ttft_ms": {
+        "p50": 168.173,
+        "p95": 180.854,
+        "mean": 172.31266666666667
+      },
+      "inter_token_latency_ms": {
+        "p50": 163.087,
+        "p95": 177.377,
+        "mean": 165.27037795275584
+      },
+      "end_to_end_latency_ms": {
+        "p50": 21286.872,
+        "p95": 21298.92,
+        "mean": 21289.137
+      }
+    }
+  ]
+}

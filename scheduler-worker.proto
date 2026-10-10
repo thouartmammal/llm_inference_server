@@ -29,6 +29,15 @@ message ScheduleTaskResponse {
   repeated SampledToken sampled_tokens = 1;
 }
 
+message CancelGenerationRequest {
+  string request_id = 1;
+}
+
+message CancelGenerationResponse {
+  bool cache_released = 1;
+}
+
 service SchedulerWorker {
   rpc ScheduleTask(ScheduleTaskBatch) returns (ScheduleTaskResponse);
+  rpc CancelGeneration(CancelGenerationRequest) returns (CancelGenerationResponse);
 }
