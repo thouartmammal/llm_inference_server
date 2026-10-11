@@ -121,7 +121,7 @@ func main() {
 	gpu := flag.String("gpu", "unspecified", "GPU model recorded in results (for example, Kaggle T4)")
 	outputDir := flag.String("output-dir", "benchmark-results", "Directory for JSON summary and CSV samples")
 	repetitions := flag.Int("repetitions", 3, "Sequential samples for each prompt/output length in idle mode")
-	schedulerMode := flag.String("scheduler", "unspecified", "Scheduler label recorded in results: naive or static")
+	schedulerMode := flag.String("scheduler", "unspecified", "Scheduler label recorded in results: naive, static, or continuous")
 	batchSize := flag.Int("batch-size", 0, "Scheduler batch size recorded in results")
 	batchWait := flag.String("batch-wait", "unspecified", "Scheduler batch wait recorded in results (for example, 50ms)")
 	flag.Parse()
@@ -135,8 +135,8 @@ func main() {
 	if *repetitions < 1 {
 		fail("repetitions must be at least 1")
 	}
-	if *schedulerMode != "unspecified" && *schedulerMode != "naive" && *schedulerMode != "static" {
-		fail("scheduler must be unspecified, naive, or static")
+	if !validSchedulerMode(*schedulerMode) {
+		fail("scheduler must be unspecified, naive, static, or continuous")
 	}
 	if *batchSize < 0 {
 		fail("batch-size cannot be negative")
@@ -574,6 +574,15 @@ func parseOutputMix(value string) ([]int, error) {
 		return nil, fmt.Errorf("provide at least one output length")
 	}
 	return values, nil
+}
+
+func validSchedulerMode(mode string) bool {
+	switch mode {
+	case "unspecified", "naive", "static", "continuous":
+		return true
+	default:
+		return false
+	}
 }
 
 func summarize(values []float64) metricSummary {

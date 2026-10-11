@@ -30,6 +30,7 @@ type gateway struct {
 	tokenizer       tokenizer
 	rpcTimeout      time.Duration
 	maxOutputTokens int
+	schedulerMode   string
 	staticBatchSize int
 	staticBatchWait time.Duration
 	batchQueue      chan *generationRequest
@@ -66,6 +67,7 @@ type generationRequest struct {
 	flusher         http.Flusher
 	done            chan struct{}
 	generatedIDs    []int
+	nextTokenID     int32
 }
 
 func main() {
@@ -139,12 +141,25 @@ func run() error {
 			return fmt.Errorf("STATIC_BATCH_WAIT must be a non-negative duration such as 50ms")
 		}
 	}
+	schedulerMode := strings.ToLower(strings.TrimSpace(os.Getenv("SCHEDULER_MODE")))
+	if schedulerMode == "" {
+		schedulerMode = "static"
+	}
+	switch schedulerMode {
+	case "naive":
+		batchSize = 1
+		batchWait = 0
+	case "static", "continuous":
+	default:
+		return fmt.Errorf("SCHEDULER_MODE must be naive, static, or continuous")
+	}
 
 	app := &gateway{
 		worker:          pb.NewSchedulerWorkerClient(conn),
 		tokenizer:       tokenizerImpl,
 		rpcTimeout:      rpcTimeout,
 		maxOutputTokens: defaultMaxOutputTokens,
+		schedulerMode:   schedulerMode,
 		staticBatchSize: batchSize,
 		staticBatchWait: batchWait,
 	}
@@ -266,130 +281,186 @@ func (g *gateway) startBatchScheduler() {
 			batchWait = 50 * time.Millisecond
 		}
 		g.batchQueue = make(chan *generationRequest, batchSize*16)
+		if g.schedulerMode == "continuous" {
+			go g.continuousLoop(batchSize, batchWait)
+			return
+		}
 		go g.batchLoop(batchSize, batchWait)
 	})
 }
 
 func (g *gateway) batchLoop(batchSize int, batchWait time.Duration) {
 	for {
-		first := <-g.batchQueue
-		batch := []*generationRequest{first}
-		if batchSize > 1 {
-			timer := time.NewTimer(batchWait)
-		collect:
-			for len(batch) < batchSize {
-				select {
-				case request := <-g.batchQueue:
-					batch = append(batch, request)
-				case <-timer.C:
-					break collect
-				}
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-		}
-		g.runStaticBatch(batch)
+		g.runStaticBatch(g.collectBatch(batchSize, batchWait, true))
 	}
 }
 
+func (g *gateway) continuousLoop(batchSize int, batchWait time.Duration) {
+	var active []*generationRequest
+	for {
+		if len(active) == 0 {
+			active = g.runBatchPhase(
+				g.collectBatch(batchSize, batchWait, true),
+				pb.Phase_PREFILL,
+			)
+			continue
+		}
+
+		availableSlots := batchSize - len(active)
+		if availableSlots > 0 {
+			newcomers := g.collectBatch(availableSlots, batchWait, false)
+			active = g.runContinuousStep(active, newcomers)
+			continue
+		}
+		active = g.runBatchPhase(active, pb.Phase_DECODE)
+	}
+}
+
+func (g *gateway) collectBatch(
+	limit int,
+	batchWait time.Duration,
+	waitForFirst bool,
+) []*generationRequest {
+	if limit < 1 {
+		return nil
+	}
+	var first *generationRequest
+	if waitForFirst {
+		first = <-g.batchQueue
+	} else {
+		select {
+		case first = <-g.batchQueue:
+		default:
+			return nil
+		}
+	}
+	batch := []*generationRequest{first}
+	if limit == 1 || batchWait <= 0 {
+		for len(batch) < limit {
+			select {
+			case request := <-g.batchQueue:
+				batch = append(batch, request)
+			default:
+				return batch
+			}
+		}
+		return batch
+	}
+
+	timer := time.NewTimer(batchWait)
+	defer timer.Stop()
+	for len(batch) < limit {
+		select {
+		case request := <-g.batchQueue:
+			batch = append(batch, request)
+		case <-timer.C:
+			return batch
+		}
+	}
+	return batch
+}
+
+func (g *gateway) runContinuousStep(
+	active []*generationRequest,
+	newcomers []*generationRequest,
+) []*generationRequest {
+	if len(newcomers) > 0 {
+		active = append(active, g.runBatchPhase(newcomers, pb.Phase_PREFILL)...)
+	}
+	if len(active) == 0 {
+		return nil
+	}
+	return g.runBatchPhase(active, pb.Phase_DECODE)
+}
+
 func (g *gateway) runStaticBatch(batch []*generationRequest) {
-	active := make([]*generationRequest, 0, len(batch))
-	for _, request := range batch {
+	active := g.runBatchPhase(batch, pb.Phase_PREFILL)
+	for len(active) > 0 {
+		active = g.runBatchPhase(active, pb.Phase_DECODE)
+	}
+}
+
+func (g *gateway) runBatchPhase(
+	requests []*generationRequest,
+	phase pb.Phase,
+) []*generationRequest {
+	active := make([]*generationRequest, 0, len(requests))
+	workerRequests := make([]*pb.ScheduleTaskRequest, 0, len(requests))
+	for _, request := range requests {
 		if request.ctx.Err() != nil {
+			if phase == pb.Phase_DECODE {
+				g.cancelWorkerRequest(request.id)
+			}
 			close(request.done)
 			continue
 		}
+		tokens := request.promptIDs
+		if phase == pb.Phase_DECODE {
+			tokens = []int32{request.nextTokenID}
+		}
+		workerRequests = append(workerRequests, &pb.ScheduleTaskRequest{
+			RequestId: request.id,
+			Phase:     phase,
+			TokenIds:  tokens,
+		})
 		active = append(active, request)
 	}
-	phase := pb.Phase_PREFILL
-	nextTokens := make(map[string]int32, len(active))
+	if len(active) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), g.rpcTimeout)
+	response, err := g.worker.ScheduleTask(ctx, &pb.ScheduleTaskBatch{Requests: workerRequests})
+	cancel()
+	if err != nil {
+		g.failBatch(active, fmt.Errorf("worker RPC failed: %w", err))
+		return nil
+	}
+	sampledByID, err := indexSampledTokens(response.GetSampledTokens(), active)
+	if err != nil {
+		g.failBatch(active, err)
+		return nil
+	}
+
+	nextActive := make([]*generationRequest, 0, len(active))
 	for _, request := range active {
-		nextTokens[request.id] = 0
+		if request.ctx.Err() != nil {
+			g.cancelWorkerRequest(request.id)
+			close(request.done)
+			continue
+		}
+		sampled := sampledByID[request.id]
+		request.generatedIDs = append(request.generatedIDs, int(sampled.GetTokenId()))
+		text, decodeErr := g.tokenizer.Decode(request.generatedIDs)
+		if decodeErr != nil {
+			g.writeRequestError(request, fmt.Errorf("decode generated token IDs: %w", decodeErr))
+			g.cancelWorkerRequest(request.id)
+			close(request.done)
+			continue
+		}
+		finished := sampled.GetFinished() || len(request.generatedIDs) >= request.maxOutputTokens
+		if writeErr := writeEvent(request.writer, request.flusher, tokenEvent{
+			RequestID: request.id,
+			TokenID:   sampled.GetTokenId(),
+			Text:      text,
+			Finished:  finished,
+		}); writeErr != nil {
+			log.Printf("write generation stream for %s: %v", request.id, writeErr)
+			g.cancelWorkerRequest(request.id)
+			close(request.done)
+			continue
+		}
+		if finished {
+			if !sampled.GetFinished() {
+				g.cancelWorkerRequest(request.id)
+			}
+			close(request.done)
+			continue
+		}
+		request.nextTokenID = sampled.GetTokenId()
+		nextActive = append(nextActive, request)
 	}
-
-	for len(active) > 0 {
-		live := active[:0]
-		workerRequests := make([]*pb.ScheduleTaskRequest, 0, len(active))
-		for _, request := range active {
-			if request.ctx.Err() != nil {
-				g.cancelWorkerRequest(request.id)
-				close(request.done)
-				continue
-			}
-			tokens := request.promptIDs
-			if phase == pb.Phase_DECODE {
-				tokens = []int32{nextTokens[request.id]}
-			}
-			workerRequests = append(workerRequests, &pb.ScheduleTaskRequest{
-				RequestId: request.id,
-				Phase:     phase,
-				TokenIds:  tokens,
-			})
-			live = append(live, request)
-		}
-		active = live
-		if len(active) == 0 {
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), g.rpcTimeout)
-		response, err := g.worker.ScheduleTask(ctx, &pb.ScheduleTaskBatch{Requests: workerRequests})
-		cancel()
-		if err != nil {
-			g.failBatch(active, fmt.Errorf("worker RPC failed: %w", err))
-			return
-		}
-		sampledByID, err := indexSampledTokens(response.GetSampledTokens(), active)
-		if err != nil {
-			g.failBatch(active, err)
-			return
-		}
-
-		nextActive := active[:0]
-		for _, request := range active {
-			if request.ctx.Err() != nil {
-				g.cancelWorkerRequest(request.id)
-				close(request.done)
-				continue
-			}
-			sampled := sampledByID[request.id]
-			request.generatedIDs = append(request.generatedIDs, int(sampled.GetTokenId()))
-			text, decodeErr := g.tokenizer.Decode(request.generatedIDs)
-			if decodeErr != nil {
-				g.writeRequestError(request, fmt.Errorf("decode generated token IDs: %w", decodeErr))
-				g.cancelWorkerRequest(request.id)
-				close(request.done)
-				continue
-			}
-			finished := sampled.GetFinished() || len(request.generatedIDs) >= request.maxOutputTokens
-			if writeErr := writeEvent(request.writer, request.flusher, tokenEvent{
-				RequestID: request.id,
-				TokenID:   sampled.GetTokenId(),
-				Text:      text,
-				Finished:  finished,
-			}); writeErr != nil {
-				log.Printf("write generation stream for %s: %v", request.id, writeErr)
-				g.cancelWorkerRequest(request.id)
-				close(request.done)
-				continue
-			}
-			if finished {
-				if !sampled.GetFinished() {
-					g.cancelWorkerRequest(request.id)
-				}
-				close(request.done)
-				continue
-			}
-			nextTokens[request.id] = sampled.GetTokenId()
-			nextActive = append(nextActive, request)
-		}
-		active = nextActive
-		phase = pb.Phase_DECODE
-	}
+	return nextActive
 }
 
 func indexSampledTokens(

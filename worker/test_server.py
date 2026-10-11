@@ -43,14 +43,21 @@ class CPUFakeTorch:
 
 
 class FakeCache:
-    def __init__(self, keys):
+    def __init__(self, keys=None, ddp_cache_data=None, config=None):
+        if ddp_cache_data is not None:
+            keys = ddp_cache_data[0][0]
+            values = ddp_cache_data[0][1]
+        else:
+            values = keys
         self.keys = keys
+        self.values = values
 
     def batch_select_indices(self, indices):
         self.keys = self.keys.index_select(0, indices)
+        self.values = self.values.index_select(0, indices)
 
-    def to_legacy_cache(self):
-        return ((self.keys, None),)
+    def __iter__(self):
+        yield self.keys, self.values, None
 
 
 class FakeModel:
@@ -242,6 +249,72 @@ class SchedulerWorkerCancelTests(unittest.TestCase):
         self.assertEqual(decode_call["past_key_values"].keys.shape[0], 2)
         self.assertEqual(servicer.caches["first"]["counts"], [2, 2])
 
+    def test_decode_merges_new_prefill_with_active_cache(self):
+        servicer = SchedulerWorkerServicer.__new__(SchedulerWorkerServicer)
+        servicer.torch = CPUFakeTorch
+        servicer.model = FakeModel()
+        servicer.stop_token_ids = {-1}
+        servicer.caches = {}
+        servicer.lock = threading.Lock()
+        context = ActiveContext()
+
+        servicer.ScheduleTask(
+            scheduler_worker_pb2.ScheduleTaskBatch(
+                requests=[
+                    scheduler_worker_pb2.ScheduleTaskRequest(
+                        request_id="active",
+                        phase=scheduler_worker_pb2.PREFILL,
+                        token_ids=[10, 11],
+                    ),
+                ],
+            ),
+            context,
+        )
+        servicer.ScheduleTask(
+            scheduler_worker_pb2.ScheduleTaskBatch(
+                requests=[
+                    scheduler_worker_pb2.ScheduleTaskRequest(
+                        request_id="late",
+                        phase=scheduler_worker_pb2.PREFILL,
+                        token_ids=[20],
+                    ),
+                ],
+            ),
+            context,
+        )
+
+        response = servicer.ScheduleTask(
+            scheduler_worker_pb2.ScheduleTaskBatch(
+                requests=[
+                    scheduler_worker_pb2.ScheduleTaskRequest(
+                        request_id="active",
+                        phase=scheduler_worker_pb2.DECODE,
+                        token_ids=[12],
+                    ),
+                    scheduler_worker_pb2.ScheduleTaskRequest(
+                        request_id="late",
+                        phase=scheduler_worker_pb2.DECODE,
+                        token_ids=[21],
+                    ),
+                ],
+            ),
+            context,
+        )
+
+        self.assertEqual(
+            [(token.request_id, token.token_id) for token in response.sampled_tokens],
+            [("active", 13), ("late", 22)],
+        )
+        decode_call = servicer.model.calls[-1]
+        self.assertEqual(decode_call["attention_mask"].tolist(), [[1, 1, 1], [0, 1, 1]])
+        self.assertEqual(decode_call["position_ids"].tolist(), [[2], [1]])
+        self.assertEqual(
+            decode_call["past_key_values"].keys[:, 0, :, 0].tolist(),
+            [[10, 11], [0, 20]],
+        )
+        self.assertIs(servicer.caches["active"], servicer.caches["late"])
+        self.assertEqual(servicer.caches["active"]["request_ids"], ["active", "late"])
+
     def test_logs_initial_cache_layout_once(self):
         servicer = SchedulerWorkerServicer.__new__(SchedulerWorkerServicer)
         cache = FakeCache(torch.zeros((1, 2, 3, 4)))
@@ -266,6 +339,10 @@ class SchedulerWorkerCancelTests(unittest.TestCase):
         cohort["request_ids"].append("other-request")
         cohort["kv"].keys = torch.cat(
             [cohort["kv"].keys, other_cohort["kv"].keys],
+            dim=0,
+        )
+        cohort["kv"].values = torch.cat(
+            [cohort["kv"].values, other_cohort["kv"].values],
             dim=0,
         )
         cohort["attention_mask"] = torch.ones((2, 2), dtype=torch.long)

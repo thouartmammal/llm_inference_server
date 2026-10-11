@@ -285,3 +285,71 @@ func TestGenerateGroupsRequestsIntoFixedStaticBatch(t *testing.T) {
 		}
 	}
 }
+
+func TestContinuousStepAdmitsPrefilledRequestToNextDecodeBatch(t *testing.T) {
+	worker := &fakeWorker{finishAt: 3}
+	app := &gateway{
+		worker:          worker,
+		tokenizer:       &fakeTokenizer{},
+		rpcTimeout:      time.Second,
+		maxOutputTokens: 8,
+	}
+	firstRecorder := httptest.NewRecorder()
+	lateRecorder := httptest.NewRecorder()
+	first := &generationRequest{
+		id:              "first",
+		promptIDs:       []int32{10, 11},
+		maxOutputTokens: 8,
+		ctx:             context.Background(),
+		writer:          firstRecorder,
+		flusher:         firstRecorder,
+		done:            make(chan struct{}),
+	}
+	late := &generationRequest{
+		id:              "late",
+		promptIDs:       []int32{20},
+		maxOutputTokens: 8,
+		ctx:             context.Background(),
+		writer:          lateRecorder,
+		flusher:         lateRecorder,
+		done:            make(chan struct{}),
+	}
+
+	active := app.runBatchPhase([]*generationRequest{first}, pb.Phase_PREFILL)
+	if len(active) != 1 {
+		t.Fatalf("active after initial prefill = %d, want 1", len(active))
+	}
+	active = app.runContinuousStep(active, []*generationRequest{late})
+
+	if len(active) != 0 {
+		t.Fatalf("active after completed decode step = %d, want 0", len(active))
+	}
+	if len(worker.calls) != 3 {
+		t.Fatalf("worker calls = %d, want two prefills and one decode", len(worker.calls))
+	}
+	for callIndex, wantPhase := range []pb.Phase{
+		pb.Phase_PREFILL,
+		pb.Phase_PREFILL,
+		pb.Phase_DECODE,
+	} {
+		if got := worker.calls[callIndex].Requests[0].GetPhase(); got != wantPhase {
+			t.Fatalf("worker call %d phase = %v, want %v", callIndex, got, wantPhase)
+		}
+	}
+	decodeRequests := worker.calls[2].GetRequests()
+	if len(decodeRequests) != 2 {
+		t.Fatalf("decode batch size = %d, want 2", len(decodeRequests))
+	}
+	if got := decodeRequests[0].GetRequestId(); got != "first" {
+		t.Fatalf("first decode request ID = %q, want first", got)
+	}
+	if got := decodeRequests[1].GetRequestId(); got != "late" {
+		t.Fatalf("second decode request ID = %q, want late", got)
+	}
+	if got := decodeRequests[0].GetTokenIds(); len(got) != 1 || got[0] != 21 {
+		t.Fatalf("first decode token IDs = %v, want [21]", got)
+	}
+	if got := decodeRequests[1].GetTokenIds(); len(got) != 1 || got[0] != 22 {
+		t.Fatalf("late decode token IDs = %v, want [22]", got)
+	}
+}

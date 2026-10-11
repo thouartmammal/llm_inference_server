@@ -89,9 +89,15 @@ class SchedulerWorkerServicer(
                 )
 
             if phase == scheduler_worker_pb2.PREFILL:
+                for request in requests:
+                    if request.request_id in self.caches:
+                        context.abort(
+                            grpc.StatusCode.ALREADY_EXISTS,
+                            "PREFILL request_id already has an active cache",
+                        )
                 logits, past_key_values, attention_mask = self._prefill(requests)
                 current_counts = [1] * len(requests)
-                previous_cohort = None
+                previous_cohorts = []
             elif phase == scheduler_worker_pb2.DECODE:
                 for request in requests:
                     if request.request_id not in self.caches:
@@ -104,7 +110,6 @@ class SchedulerWorkerServicer(
                     past_key_values,
                     attention_mask,
                     current_counts,
-                    previous_cohort,
                 ) = self._decode(requests)
             else:
                 context.abort(
@@ -139,7 +144,6 @@ class SchedulerWorkerServicer(
                     )
                 )
             self._replace_cohort(
-                previous_cohort,
                 [request.request_id for request in requests],
                 past_key_values,
                 attention_mask,
@@ -181,12 +185,9 @@ class SchedulerWorkerServicer(
     def _log_cache_layout(self, past_key_values):
         if getattr(self, "cache_layout_logged", False):
             return
-        cache = past_key_values
-        if hasattr(cache, "to_legacy_cache"):
-            cache = cache.to_legacy_cache()
 
         layers = []
-        for layer_index, layer in enumerate(cache):
+        for layer_index, layer in enumerate(self._cache_layers(past_key_values)):
             entries = []
             for item in layer:
                 if item is None:
@@ -205,27 +206,120 @@ class SchedulerWorkerServicer(
         self.cache_layout_logged = True
 
     def _decode(self, requests):
-        cohort = self.caches[requests[0].request_id]
-        if any(self.caches[request.request_id] is not cohort for request in requests):
-            raise ValueError("all decode requests must belong to the same static batch")
+        previous_cohorts = []
+        previous_cohort_ids = set()
+        cache_rows = []
+        max_cache_length = 0
+        for request in requests:
+            cohort = self.caches[request.request_id]
+            cohort_identity = id(cohort)
+            if cohort_identity not in previous_cohort_ids:
+                previous_cohort_ids.add(cohort_identity)
+                previous_cohorts.append(cohort)
 
-        cohort_indices = [
-            cohort["request_ids"].index(request.request_id)
-            for request in requests
-        ]
-        self._select_cohort_rows(cohort, cohort_indices)
-        cohort["request_ids"] = [request.request_id for request in requests]
+            row_index = cohort["request_ids"].index(request.request_id)
+            legacy_cache = self._cache_layers(cohort["kv"])
+            cache_rows.append(
+                (
+                    legacy_cache,
+                    row_index,
+                    cohort["attention_mask"][row_index : row_index + 1],
+                    cohort["counts"][row_index],
+                )
+            )
+            max_cache_length = max(
+                max_cache_length,
+                cohort["attention_mask"].shape[1],
+            )
 
-        past_key_values = cohort["kv"]
-        previous_mask = cohort["attention_mask"]
-        attention_mask = previous_mask
+        layer_count = len(cache_rows[0][0])
+        if any(len(row[0]) != layer_count for row in cache_rows):
+            raise ValueError("decode caches have different numbers of layers")
+
+        merged_layers = []
+        for layer_index in range(layer_count):
+            keys = []
+            values = []
+            optional_entries = []
+            for legacy_cache, row_index, _, _ in cache_rows:
+                layer = legacy_cache[layer_index]
+                key, value = layer[:2]
+                padding = max_cache_length - key.shape[-2]
+                if padding:
+                    key = self.torch.cat(
+                        [
+                            key.new_zeros(
+                                (*key.shape[:-2], padding, key.shape[-1])
+                            ),
+                            key,
+                        ],
+                        dim=-2,
+                    )
+                    value = self.torch.cat(
+                        [
+                            value.new_zeros(
+                                (*value.shape[:-2], padding, value.shape[-1])
+                            ),
+                            value,
+                        ],
+                        dim=-2,
+                    )
+                keys.append(key[row_index : row_index + 1])
+                values.append(value[row_index : row_index + 1])
+                optional_entries.append(layer[2:])
+
+            for entries in optional_entries[1:]:
+                if len(entries) != len(optional_entries[0]):
+                    raise ValueError(
+                        f"decode cache metadata differs at layer {layer_index}"
+                    )
+                for expected, actual in zip(optional_entries[0], entries):
+                    if expected is actual:
+                        continue
+                    equal = (
+                        self.torch.equal(expected, actual)
+                        if hasattr(expected, "shape") and hasattr(actual, "shape")
+                        else expected == actual
+                    )
+                    if not equal:
+                        raise ValueError(
+                            f"decode cache metadata differs at layer {layer_index}"
+                        )
+            merged_layers.append(
+                (
+                    self.torch.cat(keys, dim=0),
+                    self.torch.cat(values, dim=0),
+                    *optional_entries[0],
+                )
+            )
+
+        cache_type = type(previous_cohorts[0]["kv"])
+        past_key_values = cache_type(
+            ddp_cache_data=tuple(merged_layers),
+            config=getattr(self.model, "config", None),
+        )
+        attention_rows = []
+        current_counts = []
+        for _, _, mask, count in cache_rows:
+            padding = max_cache_length - mask.shape[1]
+            if padding:
+                mask = self.torch.cat(
+                    [
+                        mask.new_zeros((1, padding)),
+                        mask,
+                    ],
+                    dim=1,
+                )
+            attention_rows.append(mask)
+            current_counts.append(count + 1)
+        previous_mask = self.torch.cat(attention_rows, dim=0)
         next_mask_column = self.torch.ones(
             (len(requests), 1),
-            dtype=attention_mask.dtype,
-            device=attention_mask.device,
+            dtype=previous_mask.dtype,
+            device=previous_mask.device,
         )
         attention_mask = self.torch.cat(
-            [attention_mask, next_mask_column],
+            [previous_mask, next_mask_column],
             dim=1,
         )
         position_ids = attention_mask.sum(dim=1, keepdim=True) - 1
@@ -241,14 +335,20 @@ class SchedulerWorkerServicer(
             past_key_values=past_key_values,
             use_cache=True,
         )
-        current_counts = [cohort["counts"][index] + 1 for index in range(len(requests))]
+        current_counts = [row[3] + 1 for row in cache_rows]
         return (
             output.logits,
             output.past_key_values,
             attention_mask,
             current_counts,
-            cohort,
         )
+
+    @staticmethod
+    def _cache_layers(cache):
+        to_legacy_cache = getattr(cache, "to_legacy_cache", None)
+        if callable(to_legacy_cache):
+            return tuple(to_legacy_cache())
+        return tuple(cache)
 
     def _select_cohort_rows(self, cohort, indices):
         if not hasattr(cohort["kv"], "batch_select_indices"):
@@ -273,17 +373,14 @@ class SchedulerWorkerServicer(
 
     def _replace_cohort(
         self,
-        previous_cohort,
         request_ids,
         past_key_values,
         attention_mask,
         counts,
         surviving_indices,
     ):
-        if previous_cohort is not None:
-            for request_id in previous_cohort["request_ids"]:
-                if self.caches.get(request_id) is previous_cohort:
-                    self.caches.pop(request_id, None)
+        for request_id in request_ids:
+            self._remove_cache_request(request_id)
         if not surviving_indices:
             return
 

@@ -26,6 +26,19 @@ func TestParseOutputMix(t *testing.T) {
 	}
 }
 
+func TestValidSchedulerMode(t *testing.T) {
+	for _, mode := range []string{"unspecified", "naive", "static", "continuous"} {
+		if !validSchedulerMode(mode) {
+			t.Errorf("validSchedulerMode(%q) = false, want true", mode)
+		}
+	}
+	for _, mode := range []string{"", "Continuous", "unknown"} {
+		if validSchedulerMode(mode) {
+			t.Errorf("validSchedulerMode(%q) = true, want false", mode)
+		}
+	}
+}
+
 func TestRunRequestRecordsStreamingMetrics(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

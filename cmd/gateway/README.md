@@ -1,9 +1,9 @@
 # HTTP generation gateway
 
 This development gateway applies the Qwen2.5 single-user chat template,
-tokenizes prompts, forms fixed cohorts of requests for batched prefill and
-decode steps in the Python worker, and streams newline-delimited JSON
-snapshots to each client as tokens arrive.
+tokenizes prompts, schedules batched prefill and decode steps in the Python
+worker, and streams newline-delimited JSON snapshots to each client as tokens
+arrive.
 
 ## Prerequisites
 
@@ -40,16 +40,25 @@ It listens on `127.0.0.1:8080` by default. Override this with `GATEWAY_ADDR`.
 `GET /healthz` is a process health check; it does not verify that the worker is
 reachable.
 
-## Static batching
+## Scheduler modes
 
-The gateway defaults to a maximum batch size of 4 and waits up to 50 ms for a
-cohort to fill. A batch starts when it fills or the wait expires. Once started,
-it is a fixed cohort: requests that arrive later wait for the next batch, and
-finished or cancelled requests are removed without admitting replacements.
-Set `STATIC_BATCH_SIZE` and `STATIC_BATCH_WAIT` before starting the gateway to
-change these values. For example:
+Set `SCHEDULER_MODE` to `naive`, `static`, or `continuous`. The default is
+`static`. The load generator's `-scheduler` flag labels result files only; it
+does not configure the gateway.
+
+### Naive and static
+
+The `naive` mode uses one request per worker batch with no collection wait. It
+reproduces the one-request-at-a-time baseline. The `static` mode (the default)
+forms fixed cohorts: requests arriving after a cohort starts wait for the next
+cohort, and finished or cancelled requests are not replaced during generation.
+
+The default maximum batch size is 4 and the gateway waits up to 50 ms for a
+cohort to fill. Set `STATIC_BATCH_SIZE` and `STATIC_BATCH_WAIT` to change these
+values. For example:
 
 ```powershell
+$env:SCHEDULER_MODE = "static"
 $env:STATIC_BATCH_SIZE = "4"
 $env:STATIC_BATCH_WAIT = "50ms"
 go run .\cmd\gateway
@@ -59,14 +68,36 @@ To reproduce the Week 2 one-request-at-a-time baseline, use batch size 1 and
 zero wait:
 
 ```powershell
-$env:STATIC_BATCH_SIZE = "1"
-$env:STATIC_BATCH_WAIT = "0s"
+$env:SCHEDULER_MODE = "naive"
 go run .\cmd\gateway
 ```
 
+### Continuous batching
+
+Continuous mode keeps up to `STATIC_BATCH_SIZE` requests active. At each
+decode-step boundary, queued requests are prefetched and admitted into free
+slots; requests already decoding continue in the next shared decode batch.
+Requests that finish, reach their output limit, or are cancelled free their
+slots. The worker merges each request's modern Transformers KV cache row,
+left-padding cache and attention-mask rows when their prompt/cache lengths
+differ. This avoids converting Qwen's cache to the legacy tuple format.
+
+```powershell
+$env:SCHEDULER_MODE = "continuous"
+$env:STATIC_BATCH_SIZE = "4"
+$env:STATIC_BATCH_WAIT = "50ms"
+go run .\cmd\gateway
+```
+
+The collection wait applies to initial batches and to incoming requests once at
+least one free slot has an arrival queued; active decoding is not delayed while
+waiting for a new arrival. A newcomer is prefetched separately before joining
+the following decode step. Thus this is continuous decode-batch admission, not
+simultaneous prefill and decode execution.
+
 The worker left-pads prompts in each prefill batch and supplies attention masks
 and position IDs so padding is ignored. The worker retains a separate KV cache
-for every request in the cohort and batches decode steps for the requests that
+row for every active request and batches decode steps for the requests that
 remain active. Update `worker/server.py` and both generated Python protobuf
 files on the GPU host before testing this version.
 
