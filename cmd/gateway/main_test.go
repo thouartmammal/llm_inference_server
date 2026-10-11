@@ -7,17 +7,22 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	pb "github.com/thouartmammal/llm_inference_server/gateway"
 	"google.golang.org/grpc"
 )
 
 type fakeTokenizer struct {
+	mu      sync.Mutex
 	encoded string
 }
 
 func (f *fakeTokenizer) EncodePrompt(input string) ([]int32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.encoded = input
 	return []int32{10, 11}, nil
 }
@@ -31,6 +36,7 @@ type fakeWorker struct {
 	cancelledIDs        []string
 	finishAt            int
 	waitForCancellation bool
+	reverseResponses    bool
 	started             chan struct{}
 }
 
@@ -42,11 +48,20 @@ func (f *fakeWorker) ScheduleTask(ctx context.Context, batch *pb.ScheduleTaskBat
 		return nil, ctx.Err()
 	}
 	finished := f.finishAt != 0 && len(f.calls) >= f.finishAt
-	return &pb.ScheduleTaskResponse{SampledTokens: []*pb.SampledToken{{
-		RequestId: batch.Requests[0].GetRequestId(),
-		TokenId:   int32(20 + len(f.calls)),
-		Finished:  finished,
-	}}}, nil
+	response := &pb.ScheduleTaskResponse{}
+	for index, request := range batch.Requests {
+		response.SampledTokens = append(response.SampledTokens, &pb.SampledToken{
+			RequestId: request.GetRequestId(),
+			TokenId:   int32(20 + len(f.calls) + index*10),
+			Finished:  finished,
+		})
+	}
+	if f.reverseResponses {
+		for left, right := 0, len(response.SampledTokens)-1; left < right; left, right = left+1, right-1 {
+			response.SampledTokens[left], response.SampledTokens[right] = response.SampledTokens[right], response.SampledTokens[left]
+		}
+	}
+	return response, nil
 }
 
 func (f *fakeWorker) CancelGeneration(_ context.Context, request *pb.CancelGenerationRequest, _ ...grpc.CallOption) (*pb.CancelGenerationResponse, error) {
@@ -61,7 +76,6 @@ func TestGenerateStreamsTokensAndPassesPromptToTokenizer(t *testing.T) {
 		worker:          worker,
 		tokenizer:       tok,
 		maxOutputTokens: 512,
-		generationSlot:  make(chan struct{}, 1),
 	}
 
 	request := httptest.NewRequest(
@@ -122,7 +136,6 @@ func TestGenerateCancelsWorkerWhenOutputLimitIsReached(t *testing.T) {
 		worker:          worker,
 		tokenizer:       &fakeTokenizer{},
 		maxOutputTokens: 8,
-		generationSlot:  make(chan struct{}, 1),
 	}
 	request := httptest.NewRequest(
 		http.MethodPost,
@@ -157,7 +170,6 @@ func TestGenerateCleansWorkerCacheWhenClientCancels(t *testing.T) {
 		worker:          worker,
 		tokenizer:       &fakeTokenizer{},
 		maxOutputTokens: 8,
-		generationSlot:  make(chan struct{}, 1),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	request := httptest.NewRequest(
@@ -183,9 +195,8 @@ func TestGenerateCleansWorkerCacheWhenClientCancels(t *testing.T) {
 
 func TestGenerateRejectsEmptyPrompt(t *testing.T) {
 	app := &gateway{
-		worker:         &fakeWorker{},
-		tokenizer:      &fakeTokenizer{},
-		generationSlot: make(chan struct{}, 1),
+		worker:    &fakeWorker{},
+		tokenizer: &fakeTokenizer{},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/generate", strings.NewReader(`{"prompt":"  "}`))
 	response := httptest.NewRecorder()
@@ -194,5 +205,83 @@ func TestGenerateRejectsEmptyPrompt(t *testing.T) {
 
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
+func TestGenerateGroupsRequestsIntoFixedStaticBatch(t *testing.T) {
+	worker := &fakeWorker{finishAt: 2, reverseResponses: true}
+	app := &gateway{
+		worker:          worker,
+		tokenizer:       &fakeTokenizer{},
+		maxOutputTokens: 8,
+		staticBatchSize: 2,
+		staticBatchWait: time.Second,
+	}
+
+	responses := []*httptest.ResponseRecorder{
+		httptest.NewRecorder(),
+		httptest.NewRecorder(),
+	}
+	done := make(chan struct{}, len(responses))
+	for index := range responses {
+		go func(index int) {
+			defer func() { done <- struct{}{} }()
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/generate",
+				strings.NewReader(`{"prompt":"test"}`),
+			)
+			app.generate(responses[index], request)
+		}(index)
+	}
+	for range responses {
+		<-done
+	}
+
+	if len(worker.calls) != 2 {
+		t.Fatalf("worker calls = %d, want prefill and decode", len(worker.calls))
+	}
+	for callIndex, call := range worker.calls {
+		if len(call.Requests) != 2 {
+			t.Fatalf("worker call %d contains %d requests, want 2", callIndex, len(call.Requests))
+		}
+		wantPhase := pb.Phase_PREFILL
+		if callIndex == 1 {
+			wantPhase = pb.Phase_DECODE
+		}
+		if got := call.Requests[0].GetPhase(); got != wantPhase {
+			t.Fatalf("worker call %d phase = %v, want %v", callIndex, got, wantPhase)
+		}
+		if got := call.Requests[1].GetPhase(); got != wantPhase {
+			t.Fatalf("second request in call %d phase = %v, want %v", callIndex, got, wantPhase)
+		}
+	}
+	for index, response := range responses {
+		lines := strings.Split(strings.TrimSpace(response.Body.String()), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("response %d stream events = %d, want 2", index, len(lines))
+		}
+		var first, second tokenEvent
+		if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+			t.Fatalf("decode response %d first event: %v", index, err)
+		}
+		if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+			t.Fatalf("decode response %d second event: %v", index, err)
+		}
+		requestIndex := -1
+		for candidate, request := range worker.calls[0].Requests {
+			if request.GetRequestId() == first.RequestID {
+				requestIndex = candidate
+				break
+			}
+		}
+		if requestIndex < 0 {
+			t.Fatalf("response %d has unknown request ID %q", index, first.RequestID)
+		}
+		wantFirstToken := int32(21 + requestIndex*10)
+		wantSecondToken := wantFirstToken + 1
+		if first.TokenID != wantFirstToken || second.TokenID != wantSecondToken {
+			t.Fatalf("response %d token IDs = [%d %d], want [%d %d]", index, first.TokenID, second.TokenID, wantFirstToken, wantSecondToken)
+		}
 	}
 }

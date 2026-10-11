@@ -115,6 +115,9 @@ func TestIdleBaselineRunsPromptAndOutputCasesSequentially(t *testing.T) {
 		"test-model",
 		"test-gpu",
 		outputDir,
+		"static",
+		2,
+		"1ms",
 		prompts,
 		[]int{16, 32},
 		0,
@@ -150,8 +153,8 @@ func TestIdleBaselineRunsPromptAndOutputCasesSequentially(t *testing.T) {
 	if err := json.Unmarshal(summaryBytes, &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Mode != "idle" || result.RequestsCompleted != 12 || len(result.IdleCases) != 6 {
-		t.Fatalf("unexpected idle summary: mode=%q completed=%d cases=%d", result.Mode, result.RequestsCompleted, len(result.IdleCases))
+	if result.Mode != "idle" || result.SchedulerMode != "static" || result.BatchSize != 2 || result.BatchWait != "1ms" || result.RequestsCompleted != 12 || len(result.IdleCases) != 6 {
+		t.Fatalf("unexpected idle summary: mode=%q scheduler=%q batch=%d/%q completed=%d cases=%d", result.Mode, result.SchedulerMode, result.BatchSize, result.BatchWait, result.RequestsCompleted, len(result.IdleCases))
 	}
 
 	csvFile, err := os.Open(csvPath)

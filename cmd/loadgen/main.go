@@ -58,6 +58,9 @@ type requestResult struct {
 
 type summary struct {
 	Mode                string            `json:"mode"`
+	SchedulerMode       string            `json:"scheduler_mode"`
+	BatchSize           int               `json:"batch_size"`
+	BatchWait           string            `json:"batch_wait"`
 	Model               string            `json:"model"`
 	GPU                 string            `json:"gpu"`
 	GatewayURL          string            `json:"gateway_url"`
@@ -118,6 +121,9 @@ func main() {
 	gpu := flag.String("gpu", "unspecified", "GPU model recorded in results (for example, Kaggle T4)")
 	outputDir := flag.String("output-dir", "benchmark-results", "Directory for JSON summary and CSV samples")
 	repetitions := flag.Int("repetitions", 3, "Sequential samples for each prompt/output length in idle mode")
+	schedulerMode := flag.String("scheduler", "unspecified", "Scheduler label recorded in results: naive or static")
+	batchSize := flag.Int("batch-size", 0, "Scheduler batch size recorded in results")
+	batchWait := flag.String("batch-wait", "unspecified", "Scheduler batch wait recorded in results (for example, 50ms)")
 	flag.Parse()
 
 	if *rate <= 0 || *duration <= 0 || *warmups < 0 || *maxInflight < 1 {
@@ -128,6 +134,17 @@ func main() {
 	}
 	if *repetitions < 1 {
 		fail("repetitions must be at least 1")
+	}
+	if *schedulerMode != "unspecified" && *schedulerMode != "naive" && *schedulerMode != "static" {
+		fail("scheduler must be unspecified, naive, or static")
+	}
+	if *batchSize < 0 {
+		fail("batch-size cannot be negative")
+	}
+	if *batchWait != "unspecified" {
+		if _, err := time.ParseDuration(*batchWait); err != nil {
+			fail("invalid -batch-wait: %v", err)
+		}
 	}
 	outputMix, err := parseOutputMix(*outputMixArg)
 	if err != nil {
@@ -150,6 +167,9 @@ func main() {
 			*model,
 			*gpu,
 			*outputDir,
+			*schedulerMode,
+			*batchSize,
+			*batchWait,
 			prompts,
 			outputMix,
 			*warmups,
@@ -249,6 +269,9 @@ func main() {
 	elapsedSeconds := measureEnd.Sub(measureStart).Seconds()
 	summaryResult := summary{
 		Mode:               "poisson",
+		SchedulerMode:      *schedulerMode,
+		BatchSize:          *batchSize,
+		BatchWait:          *batchWait,
 		Model:              *model,
 		GPU:                *gpu,
 		GatewayURL:         *gatewayURL,
@@ -308,6 +331,9 @@ func runIdleBaseline(
 	model string,
 	gpu string,
 	outputDir string,
+	schedulerMode string,
+	batchSize int,
+	batchWait string,
 	prompts []promptProfile,
 	outputMix []int,
 	warmups int,
@@ -398,6 +424,9 @@ func runIdleBaseline(
 	elapsedSeconds := time.Since(start).Seconds()
 	summaryResult := summary{
 		Mode:               "idle",
+		SchedulerMode:      schedulerMode,
+		BatchSize:          batchSize,
+		BatchWait:          batchWait,
 		Model:              model,
 		GPU:                gpu,
 		GatewayURL:         endpoint,

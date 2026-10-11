@@ -1,9 +1,9 @@
 # HTTP generation gateway
 
-This development gateway accepts one user prompt at a time, applies the
-Qwen2.5 single-user chat template, tokenizes it, calls the Python worker for
-prefill and decode steps, and streams newline-delimited JSON snapshots as
-tokens arrive.
+This development gateway applies the Qwen2.5 single-user chat template,
+tokenizes prompts, forms fixed cohorts of requests for batched prefill and
+decode steps in the Python worker, and streams newline-delimited JSON
+snapshots to each client as tokens arrive.
 
 ## Prerequisites
 
@@ -40,6 +40,36 @@ It listens on `127.0.0.1:8080` by default. Override this with `GATEWAY_ADDR`.
 `GET /healthz` is a process health check; it does not verify that the worker is
 reachable.
 
+## Static batching
+
+The gateway defaults to a maximum batch size of 4 and waits up to 50 ms for a
+cohort to fill. A batch starts when it fills or the wait expires. Once started,
+it is a fixed cohort: requests that arrive later wait for the next batch, and
+finished or cancelled requests are removed without admitting replacements.
+Set `STATIC_BATCH_SIZE` and `STATIC_BATCH_WAIT` before starting the gateway to
+change these values. For example:
+
+```powershell
+$env:STATIC_BATCH_SIZE = "4"
+$env:STATIC_BATCH_WAIT = "50ms"
+go run .\cmd\gateway
+```
+
+To reproduce the Week 2 one-request-at-a-time baseline, use batch size 1 and
+zero wait:
+
+```powershell
+$env:STATIC_BATCH_SIZE = "1"
+$env:STATIC_BATCH_WAIT = "0s"
+go run .\cmd\gateway
+```
+
+The worker left-pads prompts in each prefill batch and supplies attention masks
+and position IDs so padding is ignored. The worker retains a separate KV cache
+for every request in the cohort and batches decode steps for the requests that
+remain active. Update `worker/server.py` and both generated Python protobuf
+files on the GPU host before testing this version.
+
 ## Request and streamed response
 
 Send a JSON prompt:
@@ -56,8 +86,7 @@ clients should replace their displayed text with the latest snapshot. A final
 token has `"finished": true`. Errors that happen after streaming starts are
 returned as an NDJSON object with an `"error"` field.
 
-The gateway serializes generation requests to provide a simple one-at-a-time
-baseline. Its output cap is fixed at 512 to match the worker's current cap.
+The gateway's output cap is fixed at 512 to match the worker's current cap.
 Requests can set `max_output_tokens` from 1 through 512; when omitted, the
 gateway uses 512. If the HTTP client disconnects, a request reaches that
 per-request output limit, or generation errors after the worker request starts,

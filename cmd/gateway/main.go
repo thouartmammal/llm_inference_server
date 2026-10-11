@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	pb "github.com/thouartmammal/llm_inference_server/gateway"
@@ -29,7 +30,10 @@ type gateway struct {
 	tokenizer       tokenizer
 	rpcTimeout      time.Duration
 	maxOutputTokens int
-	generationSlot  chan struct{}
+	staticBatchSize int
+	staticBatchWait time.Duration
+	batchQueue      chan *generationRequest
+	schedulerOnce   sync.Once
 }
 
 type tokenizer interface {
@@ -51,6 +55,17 @@ type tokenEvent struct {
 
 type errorEvent struct {
 	Error string `json:"error"`
+}
+
+type generationRequest struct {
+	id              string
+	promptIDs       []int32
+	maxOutputTokens int
+	ctx             context.Context
+	writer          http.ResponseWriter
+	flusher         http.Flusher
+	done            chan struct{}
+	generatedIDs    []int
 }
 
 func main() {
@@ -110,13 +125,30 @@ func run() error {
 	}
 	defer conn.Close()
 
+	batchSize := 4
+	if raw := os.Getenv("STATIC_BATCH_SIZE"); raw != "" {
+		batchSize, err = strconv.Atoi(raw)
+		if err != nil || batchSize < 1 {
+			return fmt.Errorf("STATIC_BATCH_SIZE must be a positive integer")
+		}
+	}
+	batchWait := 50 * time.Millisecond
+	if raw := os.Getenv("STATIC_BATCH_WAIT"); raw != "" {
+		batchWait, err = time.ParseDuration(raw)
+		if err != nil || batchWait < 0 {
+			return fmt.Errorf("STATIC_BATCH_WAIT must be a non-negative duration such as 50ms")
+		}
+	}
+
 	app := &gateway{
 		worker:          pb.NewSchedulerWorkerClient(conn),
 		tokenizer:       tokenizerImpl,
 		rpcTimeout:      rpcTimeout,
 		maxOutputTokens: defaultMaxOutputTokens,
-		generationSlot:  make(chan struct{}, 1),
+		staticBatchSize: batchSize,
+		staticBatchWait: batchWait,
 	}
+	app.startBatchScheduler()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.health)
@@ -180,13 +212,6 @@ func (g *gateway) generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	select {
-	case g.generationSlot <- struct{}{}:
-		defer func() { <-g.generationSlot }()
-	case <-r.Context().Done():
-		return
-	}
-
 	promptIDs, err := g.tokenizer.EncodePrompt(input.Prompt)
 	if err != nil {
 		http.Error(w, "tokenize prompt: "+err.Error(), http.StatusInternalServerError)
@@ -196,10 +221,14 @@ func (g *gateway) generate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tokenizer returned an empty prompt", http.StatusInternalServerError)
 		return
 	}
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming is not supported by this server", http.StatusInternalServerError)
+		return
+	}
+	requestID, err := newRequestID()
+	if err != nil {
+		http.Error(w, "create request ID: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -207,88 +236,209 @@ func (g *gateway) generate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Prompt-Token-Count", strconv.Itoa(len(promptIDs)))
 	w.WriteHeader(http.StatusOK)
-
-	requestID, err := newRequestID()
-	if err != nil {
-		writeStreamError(w, flusher, fmt.Errorf("create request ID: %w", err))
+	g.startBatchScheduler()
+	request := &generationRequest{
+		id:              requestID,
+		promptIDs:       promptIDs,
+		maxOutputTokens: input.MaxOutputTokens,
+		ctx:             r.Context(),
+		writer:          w,
+		flusher:         flusher,
+		done:            make(chan struct{}),
+		generatedIDs:    make([]int, 0, input.MaxOutputTokens),
+	}
+	select {
+	case g.batchQueue <- request:
+	case <-r.Context().Done():
 		return
 	}
-	workerFinished := false
-	defer func() {
-		if workerFinished {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := g.worker.CancelGeneration(ctx, &pb.CancelGenerationRequest{RequestId: requestID}); err != nil {
-			log.Printf("cancel worker request %s: %v", requestID, err)
-		}
-	}()
+	<-request.done
+}
 
-	phase := pb.Phase_PREFILL
-	tokenIDs := promptIDs
-	generatedIDs := make([]int, 0, input.MaxOutputTokens)
-	for generatedCount := 1; generatedCount <= input.MaxOutputTokens; generatedCount++ {
-		ctx, cancel := context.WithTimeout(r.Context(), g.rpcTimeout)
-		response, callErr := g.worker.ScheduleTask(ctx, &pb.ScheduleTaskBatch{
-			Requests: []*pb.ScheduleTaskRequest{{
-				RequestId: requestID,
-				Phase:     phase,
-				TokenIds:  tokenIDs,
-			}},
-		})
-		cancel()
-		if callErr != nil {
-			if r.Context().Err() != nil {
-				return
+func (g *gateway) startBatchScheduler() {
+	g.schedulerOnce.Do(func() {
+		batchSize := g.staticBatchSize
+		if batchSize < 1 {
+			batchSize = 1
+		}
+		batchWait := g.staticBatchWait
+		if batchWait < 0 {
+			batchWait = 50 * time.Millisecond
+		}
+		g.batchQueue = make(chan *generationRequest, batchSize*16)
+		go g.batchLoop(batchSize, batchWait)
+	})
+}
+
+func (g *gateway) batchLoop(batchSize int, batchWait time.Duration) {
+	for {
+		first := <-g.batchQueue
+		batch := []*generationRequest{first}
+		if batchSize > 1 {
+			timer := time.NewTimer(batchWait)
+		collect:
+			for len(batch) < batchSize {
+				select {
+				case request := <-g.batchQueue:
+					batch = append(batch, request)
+				case <-timer.C:
+					break collect
+				}
 			}
-			writeStreamError(w, flusher, fmt.Errorf("worker RPC failed: %w", callErr))
-			return
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
-		if len(response.GetSampledTokens()) != 1 {
-			writeStreamError(w, flusher, fmt.Errorf(
-				"worker returned %d tokens; expected exactly one",
-				len(response.GetSampledTokens()),
-			))
-			return
-		}
-		sampled := response.GetSampledTokens()[0]
-		if sampled.GetRequestId() != requestID {
-			writeStreamError(w, flusher, fmt.Errorf(
-				"worker returned request ID %q; expected %q",
-				sampled.GetRequestId(),
-				requestID,
-			))
-			return
-		}
-		if sampled.GetFinished() {
-			workerFinished = true
-		}
+		g.runStaticBatch(batch)
+	}
+}
 
-		generatedIDs = append(generatedIDs, int(sampled.GetTokenId()))
-		text, err := g.tokenizer.Decode(generatedIDs)
-		if err != nil {
-			writeStreamError(w, flusher, fmt.Errorf("decode generated token IDs: %w", err))
-			return
+func (g *gateway) runStaticBatch(batch []*generationRequest) {
+	active := make([]*generationRequest, 0, len(batch))
+	for _, request := range batch {
+		if request.ctx.Err() != nil {
+			close(request.done)
+			continue
 		}
-		event := tokenEvent{
-			RequestID: requestID,
-			TokenID:   sampled.GetTokenId(),
-			Text:      text,
-			Finished:  sampled.GetFinished() || generatedCount == input.MaxOutputTokens,
-		}
-		if err := writeEvent(w, flusher, event); err != nil {
-			log.Printf("write generation stream for %s: %v", requestID, err)
-			return
-		}
-		if event.Finished {
-			return
-		}
-
-		phase = pb.Phase_DECODE
-		tokenIDs = []int32{sampled.GetTokenId()}
+		active = append(active, request)
+	}
+	phase := pb.Phase_PREFILL
+	nextTokens := make(map[string]int32, len(active))
+	for _, request := range active {
+		nextTokens[request.id] = 0
 	}
 
+	for len(active) > 0 {
+		live := active[:0]
+		workerRequests := make([]*pb.ScheduleTaskRequest, 0, len(active))
+		for _, request := range active {
+			if request.ctx.Err() != nil {
+				g.cancelWorkerRequest(request.id)
+				close(request.done)
+				continue
+			}
+			tokens := request.promptIDs
+			if phase == pb.Phase_DECODE {
+				tokens = []int32{nextTokens[request.id]}
+			}
+			workerRequests = append(workerRequests, &pb.ScheduleTaskRequest{
+				RequestId: request.id,
+				Phase:     phase,
+				TokenIds:  tokens,
+			})
+			live = append(live, request)
+		}
+		active = live
+		if len(active) == 0 {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), g.rpcTimeout)
+		response, err := g.worker.ScheduleTask(ctx, &pb.ScheduleTaskBatch{Requests: workerRequests})
+		cancel()
+		if err != nil {
+			g.failBatch(active, fmt.Errorf("worker RPC failed: %w", err))
+			return
+		}
+		sampledByID, err := indexSampledTokens(response.GetSampledTokens(), active)
+		if err != nil {
+			g.failBatch(active, err)
+			return
+		}
+
+		nextActive := active[:0]
+		for _, request := range active {
+			if request.ctx.Err() != nil {
+				g.cancelWorkerRequest(request.id)
+				close(request.done)
+				continue
+			}
+			sampled := sampledByID[request.id]
+			request.generatedIDs = append(request.generatedIDs, int(sampled.GetTokenId()))
+			text, decodeErr := g.tokenizer.Decode(request.generatedIDs)
+			if decodeErr != nil {
+				g.writeRequestError(request, fmt.Errorf("decode generated token IDs: %w", decodeErr))
+				g.cancelWorkerRequest(request.id)
+				close(request.done)
+				continue
+			}
+			finished := sampled.GetFinished() || len(request.generatedIDs) >= request.maxOutputTokens
+			if writeErr := writeEvent(request.writer, request.flusher, tokenEvent{
+				RequestID: request.id,
+				TokenID:   sampled.GetTokenId(),
+				Text:      text,
+				Finished:  finished,
+			}); writeErr != nil {
+				log.Printf("write generation stream for %s: %v", request.id, writeErr)
+				g.cancelWorkerRequest(request.id)
+				close(request.done)
+				continue
+			}
+			if finished {
+				if !sampled.GetFinished() {
+					g.cancelWorkerRequest(request.id)
+				}
+				close(request.done)
+				continue
+			}
+			nextTokens[request.id] = sampled.GetTokenId()
+			nextActive = append(nextActive, request)
+		}
+		active = nextActive
+		phase = pb.Phase_DECODE
+	}
+}
+
+func indexSampledTokens(
+	sampled []*pb.SampledToken,
+	active []*generationRequest,
+) (map[string]*pb.SampledToken, error) {
+	expected := make(map[string]struct{}, len(active))
+	for _, request := range active {
+		expected[request.id] = struct{}{}
+	}
+	indexed := make(map[string]*pb.SampledToken, len(sampled))
+	for _, token := range sampled {
+		if token == nil {
+			return nil, fmt.Errorf("worker returned an empty sampled-token entry")
+		}
+		if _, ok := expected[token.GetRequestId()]; !ok {
+			return nil, fmt.Errorf("worker returned unexpected request ID %q", token.GetRequestId())
+		}
+		if _, duplicate := indexed[token.GetRequestId()]; duplicate {
+			return nil, fmt.Errorf("worker returned duplicate token for request %q", token.GetRequestId())
+		}
+		indexed[token.GetRequestId()] = token
+	}
+	if len(indexed) != len(expected) {
+		return nil, fmt.Errorf("worker returned %d tokens; expected %d", len(indexed), len(expected))
+	}
+	return indexed, nil
+}
+
+func (g *gateway) failBatch(active []*generationRequest, err error) {
+	for _, request := range active {
+		if request.ctx.Err() == nil {
+			g.writeRequestError(request, err)
+		}
+		g.cancelWorkerRequest(request.id)
+		close(request.done)
+	}
+}
+
+func (g *gateway) writeRequestError(request *generationRequest, err error) {
+	writeStreamError(request.writer, request.flusher, err)
+}
+
+func (g *gateway) cancelWorkerRequest(requestID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := g.worker.CancelGeneration(ctx, &pb.CancelGenerationRequest{RequestId: requestID}); err != nil {
+		log.Printf("cancel worker request %s: %v", requestID, err)
+	}
 }
 
 func writeEvent(w http.ResponseWriter, flusher http.Flusher, event tokenEvent) error {
