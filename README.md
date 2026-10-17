@@ -17,21 +17,20 @@ Prefill vs. Decode:
 
 
 # Architecture Diagram
-
 ```mermaid
 flowchart LR
-    C[Client] -->|gRPC prompt / stream open| G[Go Gateway]
-    G -->|tokenized request + stream handle| S[Go Scheduler]
-    S -->|allocate/release blocks| B[Go Block Manager]
-    S -->|Prefill/Decode batch + block table| W[Python Worker (PyTorch + Qwen)]
-    W -->|sampled token IDs| S
-    S -->|detokenized tokens| G
-    G -->|streamed tokens| C
+    C["Client"] -->|"gRPC prompt / stream open"| G["Go Gateway"]
+    G -->|"tokenized request + stream handle"| S["Go Scheduler"]
+    S -->|"allocate/release blocks"| B["Go Block Manager"]
+    S -->|"Prefill/Decode batch + block table"| W["Python Worker: PyTorch + Qwen"]
+    W -->|"sampled token IDs"| S
+    S -->|"detokenized tokens"| G
+    G -->|"streamed tokens"| C
 
-    C -. tab close / cancel .-> G
-    G -. cancel request .-> S
-    S -. cancel generation .-> W
-    S -. free KV blocks .-> B
+    C -. "tab close / cancel" .-> G
+    G -. "cancel request" .-> S
+    S -. "cancel generation" .-> W
+    S -. "free KV blocks" .-> B
 ```
 
 ## Design decisions
