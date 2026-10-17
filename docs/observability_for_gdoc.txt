@@ -1,0 +1,23 @@
+Last-Week Plan — Observability Additions
+
+Add the following FAANG-focused observability sections to the project plan and documentation. These are designed to be high-impact for interviews and real-world infra debugging.
+
+1) Prometheus + Grafana
+- Metrics to export: TTFT histogram, inter-token latency histogram, generated tokens/sec, batch-size histogram, queue depth, KV block utilization, GPU memory used.
+- Action items: add a `prometheus` scrape config, instrument Go and Python with Prometheus client libraries, and create a Grafana dashboard JSON showing TTFT, inter-token latency, throughput, and GPU memory.
+
+2) OpenTelemetry + Tracing (Jaeger/Tempo)
+- Traces: gateway.receive, scheduler.queue_wait, scheduler.prefill_batch, worker.prefill, scheduler.decode_step, worker.decode, gateway.stream_token.
+- Action items: add OpenTelemetry SDK instrumentation for Go/Python, export to an OTLP/Jaeger/Tempo backend, and tag spans with requestId, model, batch_size, and blockTable.
+
+3) GPU Telemetry & Profiling (NVIDIA DCGM exporter + PyTorch profiler)
+- Metrics and tools: DCGM Prometheus exporter (GPU memory, SM utilization), nvml_exporter, and torch.profiler/pyroscope for periodic flamegraphs and kernel-level profiling.
+- Action items: deploy DCGM exporter in Docker Compose, add profiling scripts for torch.profiler during benchmarks, and record flamegraphs for slow prefill/decode cases.
+
+Why these matter
+- Demonstrates full-stack SWE infra skills: metrics, tracing, logging, GPU telemetry, and profiling.
+- Recruiters and FAANG infra teams expect Prometheus/Grafana + distributed tracing plus GPU-aware telemetry for ML infra roles.
+
+Next steps
+- Paste this section into the Google Doc: https://docs.google.com/document/d/1hrpTupgoTfnQpISQdhKE5rzPCnAuOnRzWbklivtrdEQ/edit
+- If you want, change the Doc sharing to "Anyone with the link can edit" and I will attempt to write directly.

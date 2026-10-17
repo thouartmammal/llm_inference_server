@@ -4,9 +4,9 @@ services:
       context: .
       dockerfile: gateway/Dockerfile
     ports:
-      - "50051:50051"
+      - "8080:8080"
     environment:
-      - WORKER_ADDR=scheduler-worker:50051
+      - WORKER_TARGET=scheduler-worker:50051
     depends_on:
       scheduler-worker:
         condition: service_healthy

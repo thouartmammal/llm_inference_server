@@ -27,7 +27,10 @@ const defaultMaxOutputTokens = 512
 
 type gateway struct {
 	worker          pb.SchedulerWorkerClient
+	workerTarget    string
+	workerInsecure  bool
 	tokenizer       tokenizer
+	metrics         *gatewayTelemetry
 	rpcTimeout      time.Duration
 	maxOutputTokens int
 	schedulerMode   string
@@ -62,10 +65,14 @@ type generationRequest struct {
 	id              string
 	promptIDs       []int32
 	maxOutputTokens int
+	startedAt       time.Time
+	lastTokenAt     time.Time
+	tokensEmitted   int
 	ctx             context.Context
 	writer          http.ResponseWriter
 	flusher         http.Flusher
 	done            chan struct{}
+	finishOnce      sync.Once
 	generatedIDs    []int
 	nextTokenID     int32
 }
@@ -112,8 +119,9 @@ func run() error {
 		}
 	}
 
+	workerInsecure := strings.EqualFold(os.Getenv("WORKER_INSECURE"), "true")
 	var transportCredentials credentials.TransportCredentials
-	if strings.EqualFold(os.Getenv("WORKER_INSECURE"), "true") {
+	if workerInsecure {
 		transportCredentials = insecure.NewCredentials()
 	} else {
 		transportCredentials = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
@@ -156,7 +164,10 @@ func run() error {
 
 	app := &gateway{
 		worker:          pb.NewSchedulerWorkerClient(conn),
+		workerTarget:    workerTarget,
+		workerInsecure:  workerInsecure,
 		tokenizer:       tokenizerImpl,
+		metrics:         defaultGatewayTelemetry,
 		rpcTimeout:      rpcTimeout,
 		maxOutputTokens: defaultMaxOutputTokens,
 		schedulerMode:   schedulerMode,
@@ -164,9 +175,19 @@ func run() error {
 		staticBatchWait: batchWait,
 	}
 	app.startBatchScheduler()
+	log.Printf(
+		"gateway config: worker_target=%s worker_insecure=%t scheduler_mode=%s static_batch_size=%d static_batch_wait=%s rpc_timeout=%s",
+		app.workerTarget,
+		app.workerInsecure,
+		app.schedulerMode,
+		app.staticBatchSize,
+		app.staticBatchWait,
+		app.rpcTimeout,
+	)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.health)
+	mux.Handle("/metrics", app.telemetry().handler())
 	mux.HandleFunc("/generate", app.generate)
 
 	addr := os.Getenv("GATEWAY_ADDR")
@@ -191,6 +212,10 @@ func (g *gateway) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (g *gateway) telemetry() *gatewayTelemetry {
+	return telemetryForGateway(g)
 }
 
 func (g *gateway) generate(w http.ResponseWriter, r *http.Request) {
@@ -256,15 +281,26 @@ func (g *gateway) generate(w http.ResponseWriter, r *http.Request) {
 		id:              requestID,
 		promptIDs:       promptIDs,
 		maxOutputTokens: input.MaxOutputTokens,
+		startedAt:       time.Now(),
 		ctx:             r.Context(),
 		writer:          w,
 		flusher:         flusher,
 		done:            make(chan struct{}),
 		generatedIDs:    make([]int, 0, input.MaxOutputTokens),
 	}
+	log.Printf(
+		"request accepted: request_id=%s prompt_tokens=%d max_output_tokens=%d scheduler_mode=%s",
+		request.id,
+		len(promptIDs),
+		request.maxOutputTokens,
+		g.schedulerMode,
+	)
+	g.telemetry().recordRequestAccepted()
 	select {
 	case g.batchQueue <- request:
+		g.telemetry().recordQueueDepth(len(g.batchQueue))
 	case <-r.Context().Done():
+		g.finishRequest(request, "client_cancelled")
 		return
 	}
 	<-request.done
@@ -321,6 +357,7 @@ func (g *gateway) collectBatch(
 	batchWait time.Duration,
 	waitForFirst bool,
 ) []*generationRequest {
+	defer g.telemetry().recordQueueDepth(len(g.batchQueue))
 	if limit < 1 {
 		return nil
 	}
@@ -391,7 +428,7 @@ func (g *gateway) runBatchPhase(
 			if phase == pb.Phase_DECODE {
 				g.cancelWorkerRequest(request.id)
 			}
-			close(request.done)
+			g.finishRequest(request, "client_cancelled")
 			continue
 		}
 		tokens := request.promptIDs
@@ -409,10 +446,26 @@ func (g *gateway) runBatchPhase(
 		return nil
 	}
 
+	g.telemetry().recordBatchSize(phase, len(active))
+	log.Printf(
+		"dispatch worker batch: phase=%s batch_size=%d worker_target=%s",
+		phaseLabel(phase),
+		len(active),
+		g.workerTarget,
+	)
 	ctx, cancel := context.WithTimeout(context.Background(), g.rpcTimeout)
+	startedAt := time.Now()
 	response, err := g.worker.ScheduleTask(ctx, &pb.ScheduleTaskBatch{Requests: workerRequests})
 	cancel()
+	g.telemetry().recordWorkerRPC(phase, time.Since(startedAt))
 	if err != nil {
+		log.Printf(
+			"worker ScheduleTask failed: phase=%s batch_size=%d worker_target=%s err=%v",
+			phaseLabel(phase),
+			len(active),
+			g.workerTarget,
+			err,
+		)
 		g.failBatch(active, fmt.Errorf("worker RPC failed: %w", err))
 		return nil
 	}
@@ -426,7 +479,7 @@ func (g *gateway) runBatchPhase(
 	for _, request := range active {
 		if request.ctx.Err() != nil {
 			g.cancelWorkerRequest(request.id)
-			close(request.done)
+			g.finishRequest(request, "client_cancelled")
 			continue
 		}
 		sampled := sampledByID[request.id]
@@ -435,7 +488,7 @@ func (g *gateway) runBatchPhase(
 		if decodeErr != nil {
 			g.writeRequestError(request, fmt.Errorf("decode generated token IDs: %w", decodeErr))
 			g.cancelWorkerRequest(request.id)
-			close(request.done)
+			g.finishRequest(request, "decode_error")
 			continue
 		}
 		finished := sampled.GetFinished() || len(request.generatedIDs) >= request.maxOutputTokens
@@ -447,14 +500,19 @@ func (g *gateway) runBatchPhase(
 		}); writeErr != nil {
 			log.Printf("write generation stream for %s: %v", request.id, writeErr)
 			g.cancelWorkerRequest(request.id)
-			close(request.done)
+			g.finishRequest(request, "stream_error")
 			continue
 		}
+		g.telemetry().recordTokenEmission(request)
 		if finished {
 			if !sampled.GetFinished() {
 				g.cancelWorkerRequest(request.id)
 			}
-			close(request.done)
+			if len(request.generatedIDs) >= request.maxOutputTokens && !sampled.GetFinished() {
+				g.finishRequest(request, "output_limit")
+				continue
+			}
+			g.finishRequest(request, "completed")
 			continue
 		}
 		request.nextTokenID = sampled.GetTokenId()
@@ -496,8 +554,18 @@ func (g *gateway) failBatch(active []*generationRequest, err error) {
 			g.writeRequestError(request, err)
 		}
 		g.cancelWorkerRequest(request.id)
-		close(request.done)
+		g.finishRequest(request, "worker_error")
 	}
+}
+
+func (g *gateway) finishRequest(request *generationRequest, outcome string) {
+	if request == nil {
+		return
+	}
+	request.finishOnce.Do(func() {
+		g.telemetry().recordRequestFinished(request, outcome)
+		close(request.done)
+	})
 }
 
 func (g *gateway) writeRequestError(request *generationRequest, err error) {
@@ -508,7 +576,12 @@ func (g *gateway) cancelWorkerRequest(requestID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := g.worker.CancelGeneration(ctx, &pb.CancelGenerationRequest{RequestId: requestID}); err != nil {
-		log.Printf("cancel worker request %s: %v", requestID, err)
+		log.Printf(
+			"cancel worker request failed: request_id=%s worker_target=%s err=%v",
+			requestID,
+			g.workerTarget,
+			err,
+		)
 	}
 }
 

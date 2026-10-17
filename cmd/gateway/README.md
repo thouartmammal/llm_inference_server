@@ -40,6 +40,12 @@ It listens on `127.0.0.1:8080` by default. Override this with `GATEWAY_ADDR`.
 `GET /healthz` is a process health check; it does not verify that the worker is
 reachable.
 
+`GET /metrics` exposes Prometheus metrics for the gateway and scheduler path.
+The starter dashboard in `monitoring/grafana/dashboards/gateway.json` expects
+metrics such as `llm_gateway_time_to_first_token_seconds`,
+`llm_gateway_inter_token_latency_seconds`, `llm_scheduler_queue_depth`,
+`llm_scheduler_batch_size`, and `llm_scheduler_worker_rpc_seconds`.
+
 ## Scheduler modes
 
 Set `SCHEDULER_MODE` to `naive`, `static`, or `continuous`. The default is

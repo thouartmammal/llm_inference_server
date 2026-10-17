@@ -353,3 +353,25 @@ func TestContinuousStepAdmitsPrefilledRequestToNextDecodeBatch(t *testing.T) {
 		t.Fatalf("late decode token IDs = %v, want [22]", got)
 	}
 }
+
+func TestMetricsEndpointExposesGatewayAndSchedulerMetrics(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+
+	defaultGatewayTelemetry.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"llm_gateway_requests_total",
+		"llm_gateway_time_to_first_token_seconds",
+		"llm_scheduler_queue_depth",
+		"llm_scheduler_worker_rpc_seconds",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics output missing %q: %s", want, body)
+		}
+	}
+}

@@ -348,6 +348,10 @@ class SchedulerWorkerServicer(
         to_legacy_cache = getattr(cache, "to_legacy_cache", None)
         if callable(to_legacy_cache):
             return tuple(to_legacy_cache())
+        key_cache = getattr(cache, "key_cache", None)
+        value_cache = getattr(cache, "value_cache", None)
+        if isinstance(key_cache, list) and isinstance(value_cache, list):
+            return tuple(zip(key_cache, value_cache))
         return tuple(cache)
 
     def _select_cohort_rows(self, cohort, indices):
