@@ -45,10 +45,10 @@ In static batching, my scheduler waits for a fixed number of requests (e.g., bat
 
 In continuous matching, if a request finishes early, its slot in the batch is immediately free and the scheduler can inject a new request.
 
+Static batching is easy to get started with because that is the traditional batch processing in deep learning. But every high-performance inference engine today relies on continuous batching, so I want to compare these two techniques.
+
 ## KV strategy
 - As of right now (17th Oct 2026), we are using a per-request KV cache so that we can simply validate the control flow. Not implemented yet: true paged KV/block manager-backed physical allocation for memory-efficiency optimisation.
-
-Static batching is easy to get started with because that is the traditional batch processing in deep learning. But every high-performance inference engine today relies on continuous batching, so I want to compare these two techniques.
 
 ## Observability
 - Prometheus as the time-series database. It scrapes metrics from my LLM inference  workers, but it's monitoring screens is not the best. 
